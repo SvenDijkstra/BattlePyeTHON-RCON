@@ -28,25 +28,39 @@ class Colors:
     GRAY = '\033[90m'
 
 class BattlEyeClient:
-    def __init__(self, host: str, port: int, password: str, message_handler: Callable):
+    def __init__(self, host: str, port: int, password: str, message_handler: Callable, disconnect_handler: Callable):
         self.host = host
         self.port = port
         self.password = password
         self.message_handler = message_handler
+        self.disconnect_handler = disconnect_handler
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.settimeout(5.0)
         self.sequence = 0
         self.connected = False
         self.last_packet_time = time.time()
-        self.keepalive_interval = 30
         self.ack_events = {}  # sequence -> threading.Event
         self.ack_data = {}    # sequence -> data
+        self.response_received = {}  # sequence -> bool (whether server message response received)
         self.lock = threading.Lock()
         self.logger = logging.getLogger('BattlEyeClient')
+        self.listener_thread = None
+        self.command_in_progress = False
+        self.command_responses = set()
 
     def connect(self) -> bool:
         """Connect to the BattlEye RCon server."""
         try:
+            # Create new socket for each connection attempt
+            if hasattr(self, 'socket') and self.socket:
+                try:
+                    self.socket.close()
+                except:
+                    pass
+            
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.settimeout(5.0)
+            
             # Create login packet (0x00 type + password)
             login_payload = bytes([0x00]) + self.password.encode('ascii')
             login_packet = self._create_packet(login_payload)
@@ -62,7 +76,10 @@ class BattlEyeClient:
             if data == b'BEi\xdd\xde6\xff\x00\x01':
                 self.connected = True
                 self.last_packet_time = time.time()
-                threading.Thread(target=self._listen, daemon=True).start()
+                # Start listener thread
+                if self.listener_thread is None or not self.listener_thread.is_alive():
+                    self.listener_thread = threading.Thread(target=self._listen, daemon=True)
+                    self.listener_thread.start()
                 return True
                 
             # Normal packet parsing
@@ -72,7 +89,10 @@ class BattlEyeClient:
                 if success:
                     self.connected = True
                     self.last_packet_time = time.time()
-                    threading.Thread(target=self._listen, daemon=True).start()
+                    # Start listener thread
+                    if self.listener_thread is None or not self.listener_thread.is_alive():
+                        self.listener_thread = threading.Thread(target=self._listen, daemon=True)
+                        self.listener_thread.start()
                     return True
                 else:
                     self.logger.error("Login failed: Invalid password")
@@ -127,44 +147,68 @@ class BattlEyeClient:
         if not self.connected:
             raise ConnectionError("Not connected to server")
             
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
+        # Check if another command is in progress
+        if self.command_in_progress:
+            self.logger.debug("Command already in progress, waiting for completion")
+            # Wait a bit for the previous command to complete
+            time.sleep(0.5)
+            if self.command_in_progress:
+                self.logger.warning("Previous command still in progress, proceeding anyway")
+        
+        self.command_in_progress = True
+        
+        try:
+            with self.lock:
+                seq = self.sequence
+                self.sequence = (self.sequence + 1) % 256
+                event = threading.Event()
+                self.ack_events[seq] = event
+                self.ack_data[seq] = None
+                self.response_received[seq] = False
+                
+            cmd_payload = bytes([0x01, seq]) + command.encode('ascii')
+            cmd_packet = self._create_packet(cmd_payload)
+            
+            self.logger.debug(f"Sending command: {command} with sequence {seq}")
+            self.socket.sendto(cmd_packet, (self.host, self.port))
+            self.last_packet_time = time.time()
+            
+            # Wait for response with timeout
+            if event.wait(10.0):  # 10 second timeout
                 with self.lock:
-                    seq = self.sequence
-                    self.sequence = (self.sequence + 1) % 256
-                    event = threading.Event()
-                    self.ack_events[seq] = event
-                    self.ack_data[seq] = None
-                    
-                cmd_payload = bytes([0x01, seq]) + command.encode('ascii')
-                cmd_packet = self._create_packet(cmd_payload)
-                
-                self.logger.debug(f"Attempt {attempt + 1}: Sending command: {command}")
-                self.socket.sendto(cmd_packet, (self.host, self.port))
-                self.last_packet_time = time.time()
-                
-                # Wait for response with shorter timeout for retries
-                timeout = 5.0 if attempt < max_retries - 1 else 10.0
-                if event.wait(timeout):
-                    with self.lock:
-                        response = self.ack_data.pop(seq, '')
+                    response = self.ack_data.pop(seq, '')
+                    self.ack_events.pop(seq, None)
+                    self.response_received.pop(seq, None)
+                    # Clean up after some time to prevent the set from growing indefinitely
+                    if response in self.command_responses:
+                        threading.Timer(5.0, lambda: self.command_responses.discard(response)).start()
+                    return response
+            else:
+                # Check if we actually received a server message response
+                with self.lock:
+                    if seq in self.response_received and self.response_received[seq]:
+                        # We got a server message but not a direct response,
+                        # consider this a success with empty response
                         self.ack_events.pop(seq, None)
-                        if response:
-                            return response
-                        elif attempt < max_retries - 1:
-                            continue  # Empty response, try again
-                        raise ValueError("Empty response from server")
-                        
-            except Exception as e:
-                self.logger.debug(f"Command attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    raise TimeoutError(f"No valid response after {max_retries} attempts")
+                        self.ack_data.pop(seq, None)
+                        self.response_received.pop(seq, None)
+                        return ""
+                    else:
+                        # Clean up
+                        self.ack_events.pop(seq, None)
+                        self.ack_data.pop(seq, None)
+                        self.response_received.pop(seq, None)
+                        raise TimeoutError(f"No response received for command: {command}")
                     
-        raise TimeoutError("Command failed after retries")
+        except Exception as e:
+            self.logger.debug(f"Command failed: {e}")
+            raise
+        finally:
+            self.command_in_progress = False
     
     def _listen(self) -> None:
         """Listener thread that handles all incoming packets."""
+        self.logger.debug("Starting listener thread")
         while self.connected:
             try:
                 data, _ = self.socket.recvfrom(4096)
@@ -185,7 +229,9 @@ class BattlEyeClient:
                         with self.lock:
                             if seq in self.ack_events:
                                 self.ack_data[seq] = response
+                                self.response_received[seq] = True
                                 self.ack_events[seq].set()
+                                self.logger.debug(f"Got command response for seq {seq}: {response[:30]}...")
                 
                 elif packet_type == 0x02:  # Server message
                     if len(payload) >= 2:
@@ -196,32 +242,52 @@ class BattlEyeClient:
                         self.socket.sendto(ack_packet, (self.host, self.port))
                         # Process message
                         message = payload[2:].decode('ascii', errors='replace') if len(payload) > 2 else ''
-                        if message and self.message_handler:
+                        
+                        # Check if this is a response to a command (e.g. "Processing Command: players")
+                        if "Processing Command:" in message:
+                            # Mark as response received for any active command
+                            with self.lock:
+                                for cmd_seq in self.ack_events:
+                                    self.response_received[cmd_seq] = True
+                                    
+                        # If contains player list, this is a response to the players command
+                        if "Players on server:" in message:
+                            # Look for active player command
+                            with self.lock:
+                                for cmd_seq in list(self.ack_events.keys()):
+                                    if self.response_received[cmd_seq]:
+                                        self.ack_data[cmd_seq] = message
+                                        self.ack_events[cmd_seq].set()
+                                        self.command_responses.add(message)
+                                        self.logger.debug(f"Found player response for seq {cmd_seq}")
+                        
+                        if message and self.message_handler and message not in self.command_responses:
                             self.message_handler(message)
                             
             except socket.timeout:
+                # Socket timeout is expected, just continue
                 continue
+            except ConnectionResetError:
+                self.logger.error("Connection reset by server")
+                break
+            except OSError as e:
+                # Socket might be closed
+                if e.errno == 9:  # Bad file descriptor
+                    break
+                self.logger.error(f"Socket error: {e}")
+                break
             except Exception as e:
                 self.logger.error(f"Listener error: {e}")
-                self.connected = False
-
-    def keepalive(self) -> None:
-        """Send keepalive packet if needed."""
-        if self.connected and (time.time() - self.last_packet_time) > self.keepalive_interval:
-            try:
-                # Empty command packet for keepalive (0x01 type + sequence)
-                with self.lock:
-                    seq = self.sequence
-                    self.sequence = (self.sequence + 1) % 256
-                
-                keepalive_payload = bytes([0x01, seq])
-                keepalive_packet = self._create_packet(keepalive_payload)
-                self.socket.sendto(keepalive_packet, (self.host, self.port))
-                self.last_packet_time = time.time()
-                self.logger.debug("Sent keepalive packet")
-            except Exception as e:
-                self.logger.error(f"Keepalive failed: {e}")
-                self.connected = False
+                break
+        
+        # Only notify about disconnection if we were previously connected
+        if self.connected:
+            self.logger.debug("Listener thread detected disconnection")
+            self.connected = False
+            if self.disconnect_handler:
+                self.disconnect_handler()
+        
+        self.logger.debug("Listener thread exiting")
 
     def close(self) -> None:
         """Close the connection."""
@@ -243,8 +309,8 @@ class RconShell(cmd.Cmd):
         self.config_path = config_path
         self.client: Optional[BattlEyeClient] = None
         self.debug = debug
-        self.keepalive_thread: Optional[threading.Thread] = None
         self.running = False
+        self.disconnect_event = threading.Event()
         self.history_file = os.path.expanduser('~/.rcon_history')
         self._setup_logging()
         self._load_history()
@@ -281,19 +347,24 @@ class RconShell(cmd.Cmd):
         """Connect to the RCON server."""
         self.logger.info(f"{Colors.OKBLUE}Connecting to {self.host}:{self.port}...{Colors.ENDC}")
         
+        # Clean up any existing client
+        if self.client:
+            self.client.close()
+            
+        # Reset disconnect event
+        self.disconnect_event.clear()
+            
         self.client = BattlEyeClient(
             self.host,
             self.port,
             self.password,
-            self.message_handler
+            self.message_handler,
+            self.handle_disconnect
         )
         
         if self.client.connect():
             self.logger.info(f"{Colors.OKGREEN}Connected successfully!{Colors.ENDC}")
             self.running = True
-            # Start keepalive thread
-            self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
-            self.keepalive_thread.start()
             return True
         else:
             self.logger.error(f"{Colors.FAIL}Failed to connect to server. Please check:")
@@ -302,15 +373,57 @@ class RconShell(cmd.Cmd):
             self.logger.error(f"- BattlEye RCON is enabled on server{Colors.ENDC}")
             return False
     
-    def _keepalive_loop(self) -> None:
-        """Keepalive loop that runs in a separate thread."""
-        while self.running and self.client:
-            try:
-                self.client.keepalive()
-                time.sleep(5)  # Check every 5 seconds
-            except Exception as e:
-                self.logger.error(f"{Colors.FAIL}Keepalive error: {e}{Colors.ENDC}")
+    def handle_disconnect(self) -> None:
+        """Signal that the server has disconnected."""
+        self.logger.debug("Disconnect handler called")
+        self.disconnect_event.set()
+        
+    def check_connection(self) -> None:
+        """Check if the disconnect event has been triggered and handle it."""
+        if self.disconnect_event.is_set():
+            self.disconnect_event.clear()
+            self._handle_disconnect_prompt()
+    
+    def _handle_disconnect_prompt(self) -> None:
+        """Show disconnection prompt and handle user response."""
+        print(f"\n{Colors.FAIL}Disconnected from server.{Colors.ENDC}")
+        
+        while True:
+            choice = input(f"{Colors.BOLD}(R) Reconnect (N) New Connection (E) Exit: {Colors.ENDC}").strip().upper()
+            
+            if choice == 'R':
+                print(f"{Colors.OKBLUE}Attempting to reconnect...{Colors.ENDC}")
+                if self.connect():
+                    break
+                else:
+                    print(f"{Colors.FAIL}Reconnection failed.{Colors.ENDC}")
+            
+            elif choice == 'N':
+                host = input(f"{Colors.BOLD}Enter server host [{self.host}]: {Colors.ENDC}").strip() or self.host
+                port_str = input(f"{Colors.BOLD}Enter server port [{self.port}]: {Colors.ENDC}").strip() or str(self.port)
+                password = input(f"{Colors.BOLD}Enter RCON password: {Colors.ENDC}").strip() or self.password
+                
+                try:
+                    port = int(port_str)
+                    self.host = host
+                    self.port = port
+                    self.password = password
+                    
+                    print(f"{Colors.OKBLUE}Connecting to new server...{Colors.ENDC}")
+                    if self.connect():
+                        break
+                    else:
+                        print(f"{Colors.FAIL}Connection to new server failed.{Colors.ENDC}")
+                except ValueError:
+                    print(f"{Colors.FAIL}Invalid port number.{Colors.ENDC}")
+            
+            elif choice == 'E':
                 self.running = False
+                print(f"{Colors.WARNING}Exiting RCON shell...{Colors.ENDC}")
+                sys.exit(0)
+                
+            else:
+                print(f"{Colors.WARNING}Invalid option. Please select R, N, or E.{Colors.ENDC}")
     
     def message_handler(self, message: str) -> None:
         """Handle incoming server messages."""
@@ -320,6 +433,12 @@ class RconShell(cmd.Cmd):
     
     def default(self, line: str) -> None:
         """Handle any command that's not explicitly defined."""
+        # First check if we're still connected
+        self.check_connection()
+        
+        if not self.running:
+            return
+            
         if line.strip().lower() in ('exit', 'quit'):
             return self.do_exit(line)
         
@@ -333,12 +452,20 @@ class RconShell(cmd.Cmd):
                 print(f"{Colors.OKGREEN}Response:{Colors.ENDC} {response}")
         except TimeoutError:
             self.logger.error(f"{Colors.FAIL}Command timed out{Colors.ENDC}")
+            # Check connection after timeout
+            if self.client and not self.client.connected:
+                self._handle_disconnect_prompt()
         except ConnectionError:
             self.logger.error(f"{Colors.FAIL}Not connected to server{Colors.ENDC}")
-            if not self.connect():
-                return self.do_exit('')
+            self._handle_disconnect_prompt()
         except Exception as e:
             self.logger.error(f"{Colors.FAIL}Error executing command: {e}{Colors.ENDC}")
+    
+    def postcmd(self, stop, line):
+        """Check connection status after each command."""
+        if not stop:
+            self.check_connection()
+        return stop
     
     def do_players(self, arg: str) -> None:
         """List players on the server."""
