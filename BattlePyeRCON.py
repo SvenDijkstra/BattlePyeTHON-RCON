@@ -497,12 +497,58 @@ def main():
     parser.add_argument('-p', '--port', type=int, default=2302, help='RCON server port')
     parser.add_argument('-P', '--password', required=True, help='RCON server password')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('-c', '--command', help='Send a single command and exit')
     
     args = parser.parse_args()
     
     try:
-        shell = RconShell(args.host, args.port, args.password, config_path, args.debug)
-        shell.cmdloop()
+        if args.command:
+            # Non-interactive mode: connect, send command, exit
+            logging.basicConfig(
+                level=logging.DEBUG if args.debug else logging.INFO,
+                format='%(message)s'
+            )
+            
+            # Creating a simple message handler for non-interactive mode
+            def message_handler(message):
+                if message and "Logged In!" not in message:
+                    print(f"{Colors.OKBLUE}Server:{Colors.ENDC} {message}")
+            
+            # Simple disconnect handler
+            def disconnect_handler():
+                logging.debug("Disconnected from server")
+            
+            client = BattlEyeClient(
+                args.host, 
+                args.port, 
+                args.password, 
+                message_handler, 
+                disconnect_handler
+            )
+            
+            print(f"{Colors.OKBLUE}Connecting to {args.host}:{args.port}...{Colors.ENDC}")
+            if client.connect():
+                print(f"{Colors.OKGREEN}Connected successfully!{Colors.ENDC}")
+                command = args.command
+                
+                
+                try:
+                    response = client.run(command)
+                    if response:
+                        print(f"{Colors.OKGREEN}Response:{Colors.ENDC} {response}")
+                    # Give a moment for any server message responses to arrive
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f"{Colors.FAIL}Error executing command: {e}{Colors.ENDC}")
+                finally:
+                    client.close()
+            else:
+                print(f"{Colors.FAIL}Failed to connect to server.{Colors.ENDC}")
+                sys.exit(1)
+        else:
+            # Interactive mode
+            shell = RconShell(args.host, args.port, args.password, config_path, args.debug)
+            shell.cmdloop()
     except KeyboardInterrupt:
         print(f"\n{Colors.WARNING}Received keyboard interrupt. Exiting...{Colors.ENDC}")
     except Exception as e:
