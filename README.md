@@ -102,12 +102,3 @@ Contributions are welcome, especially to address the known issues and improve th
 * Adding a configuration file.
 * Adding a reconnection mechanism.
 * Adding multithreading.
-
-## License
-
-\[\*Insert your chosen license here.  If you don't have one, consider using MIT or GPL-3.0.\*\]
-
-## Acknowledgements
-
-* Thanks to the Battle Eye developers for creating the RCON protocol.
-* Thanks to the Arma Reforger developers.
