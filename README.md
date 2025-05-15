@@ -2,8 +2,6 @@
 
 A Python-based Battle Eye RCON tool for Linux, primarily designed for Arma Reforger.
 
-**Please Note:** This tool is currently in a poorly functioning state and requires significant cleanup, checks, and improvements.  Specifically, connection timeout and disconnect handling are broken. Use with caution.
-
 ## Purpose
 
 This tool provides command-line access to the Battle Eye RCON interface, enabling server administrators to manage their Arma Reforger servers from a Linux environment.  Existing RCON tools are often Windows-centric, and this project aims to bridge that gap.
