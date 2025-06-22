@@ -22,49 +22,6 @@ The following dependencies are required and tested on Ubuntu 24.04.2 LTS:
 * `rcon`
 * `crc32c`
 
-Installation steps:
-
-1.  Install Python 3:
-
-    ```
-    sudo apt install python3
-    ```
-
-2.  Install `pip`:
-
-    ```
-    sudo apt install python3-pip
-    ```
-
-3.  Install `python3-rcon`:
-
-    ```
-    sudo apt install python3-rcon
-    ```
-
-4.  Install `python3-crc32c`:
-
-    ```
-    sudo apt install python3-crc32c
-    ```
-
-5.  (Optional) It's generally good practice to use a virtual environment:
-
-    ```
-    python3 -m venv .venv #creates a virtual environment in a folder called .venv
-    source .venv/bin/activate #activates the virtual environment
-    ```
-
-6.  (Optional)Other python dependencies:
-    
-    All other python dependencies, should come with the python3 installation.
-    They can also be install manually.
-    ```
-    pip install argparse cmd configparser #These are in the standard library, but pip will ensure they are present.
-    pip install crc32c # This was already installed via apt, but doing it again with pip is usually harmless and good practice in a venv.
-    pip install readline #This is also in the standard library, but pip will ensure it is present.
-    ```
-
 ## Usage
 
 The tool is a command-line script that requires the following arguments:
@@ -97,10 +54,8 @@ This command will capture and display UDP packets on port 20002, showing detaile
 ## Limitations (Major - Requires Attention)
 
 * **Broken Connection Timeout:** The connection timeout mechanism is not working as expected.
-* **Broken Disconnect Handler:** The disconnect handler is faulty.
-* Poor/Unreliable Performance: The tool is described as "very poorly" functioning.
-* Lack of input validation and error handling.
-* Likely lacks more robust features.
+* **Broken Disconnect Handler:** 
+* input validation and error handling.
 
 ## Contributing
 
